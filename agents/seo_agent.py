@@ -2,70 +2,111 @@ import logging
 import re
 import json
 import pandas as pd
+from urllib.parse import urlparse
 import litellm 
 from typing import Dict, Any, List
-from pydantic import BaseModel, Field
 from utils.sheets import load_seo_data
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-class SEOQueryPlan(BaseModel):
-    filters: List[Dict[str, Any]] = Field(default_factory=list)
-    limit: int = 100
-
 class SEOAgent:
-    def __init__(self):
-        self.df = None
-
-    def load_data(self, df: pd.DataFrame):
+    def __init__(self, df: pd.DataFrame = None):
+        """Initialize SEOAgent with optional DataFrame.
+        
+        Args:
+            df: Optional DataFrame containing SEO data. If not provided,
+                it will be loaded on demand in batch_lookup_seo_data.
+        """
         self.df = df
-        # Normalize columns
-        self.df.columns = [c.strip() for c in self.df.columns]
+
+    async def batch_lookup_seo_data(self, paths: List[str]) -> Dict[str, Any]:
+        """Fusion Lookup."""
+        # Use stored DataFrame if available, otherwise load fresh
+        if self.df is None:
+            df, error = load_seo_data()
+            if error or df.empty:
+                logger.error(f"Failed to load SEO data: {error}")
+                return {}
+        else:
+            df = self.df
+            
+        if df.empty: 
+            return {}
+
+        lookup_map = {}
+        
+        # Determine URL column (Address or URL)
+        url_col = next((c for c in df.columns if c.lower() in ['address', 'url']), None)
+        if not url_col: 
+            return {}
+
+        # Pre-compute paths for matching
+        # Use a copy to avoid SettingWithCopy warnings on cached DF
+        match_df = df[[url_col]].copy()
+        match_df['path'] = match_df[url_col].astype(str).apply(lambda x: urlparse(x).path.rstrip('/'))
+        
+        # Create dictionary for O(1) lookup
+        # Map path -> index in original DF
+        path_to_idx = dict(zip(match_df['path'], match_df.index))
+
+        for path in paths:
+            clean_path = path.strip().rstrip('/')
+            if not clean_path: clean_path = "/"
+            
+            if clean_path in path_to_idx:
+                row = df.iloc[path_to_idx[clean_path]].to_dict()
+                lookup_map[path] = {
+                    "title": row.get("Title 1", "N/A"),
+                    "status": row.get("Status Code", "Unknown"),
+                    "indexability": row.get("Indexability", "Unknown")
+                }
+            else:
+                lookup_map[path] = {"error": "Not found in crawl"}
+        
+        return lookup_map
 
     async def execute_query(self, query: str) -> Dict[str, Any]:
-        if self.df is None or self.df.empty:
-             return {"answer": "No SEO data loaded.", "data": None}
+        if self.df is None:
+            df, error = load_seo_data()
+            if error or df.empty:
+                logger.error(f"Failed to load SEO data: {error}")
+                return {"answer": f"Error loading SEO data: {error}", "data": None}
+        else:
+            df = self.df
+            
+        if df.empty:
+             return {"answer": "No SEO data available.", "data": None}
 
         try:
             # 1. LLM Planning
-            system_prompt = f"""Analyze this SEO question. 
-            Available columns: {list(self.df.columns)[:10]}...
-            Return JSON: {{ "filters": [{{"column": "Name", "operator": "==", "value": "x"}}], "limit": 10 }}"""
+            system_prompt = f"""Analyze SEO question. Columns: {list(df.columns)[:15]}. 
+            Return JSON: {{ "limit": 10 }}"""
             
-            # FIX: Changed model to 'gemini-2.5-flash'
             response = litellm.completion(
                 model="openai/gemini-2.5-flash",
                 messages=[{"role": "system", "content": system_prompt}, {"role": "user", "content": query}],
                 temperature=0.0
             )
             
-            # Clean JSON
-            content = response.choices[0].message.content
-            content = re.sub(r'```json\s*|```\s*', '', content).strip()
-            
-            try:
-                plan_dict = json.loads(content)
-            except:
-                plan_dict = {}
+            # 2. Hybrid Filtering
+            result_df = df.copy()
+            q = query.lower()
 
-            # 2. Apply Logic
-            result_df = self.df.copy()
+            if "https" in q and "not" in q:
+                url_col = next((c for c in result_df.columns if c.lower() in ['address', 'url']), None)
+                if url_col:
+                    result_df = result_df[result_df[url_col].astype(str).str.startswith('http://', na=False)]
+
+            # 3. Output
+            result_data = result_df.head(20).fillna("").to_dict(orient='records')
             
-            if "missing meta descriptions" in query.lower():
-                cols = [c for c in result_df.columns if "meta description" in c.lower()]
-                if cols:
-                    result_df = result_df[result_df[cols[0]].isna() | (result_df[cols[0]] == "")]
-            
-            result_data = result_df.head(plan_dict.get("limit", 10)).fillna("").to_dict(orient='records')
-            
-            # 3. Generate Answer
-            answer_prompt = f"Summarize these SEO results for query '{query}': {str(result_data)[:1000]}"
-            
-            # FIX: Changed model to 'gemini-2.5-flash'
+            # Clean data for LLM Context
+            clean_data = [{k:v for k,v in r.items() if str(v).strip()} for r in result_data]
+
             summ_resp = litellm.completion(
                 model="openai/gemini-2.5-flash", 
-                messages=[{"role": "user", "content": answer_prompt}]
+                messages=[{"role": "user", "content": f"Summarize for '{query}': {str(clean_data)[:3000]}"}]
             )
             
             return {
@@ -75,20 +116,21 @@ class SEOAgent:
 
         except Exception as e:
             logger.error(f"SEO Agent Error: {e}")
-            return {"answer": f"Error analyzing SEO data: {e}", "data": None}
+            return {"answer": f"Error: {e}", "data": None}
 
+# Initialize with None, will be populated in initialize_seo_agent
 seo_agent = SEOAgent()
 
 async def run_seo_agent(query: str, df: pd.DataFrame = None) -> Dict[str, Any]:
-    global seo_agent
+    """Run SEO analysis on the given query.
     
-    # Lazy Load
-    if seo_agent.df is None:
-        try:
-            logger.info("Loading SEO Data from Sheets...")
-            loaded_df = load_seo_data()
-            seo_agent.load_data(loaded_df)
-        except Exception as e:
-            return {"answer": f"Failed to load SEO Sheet: {e}", "data": None}
+    Args:
+        query: The search query or URL to analyze
+        df: Optional DataFrame with SEO data. If not provided, uses the agent's data.
             
-    return await seo_agent.execute_query(query)
+    Returns:
+        Dict with SEO analysis results
+    """
+    # If df is provided, use it. Otherwise, rely on the agent's data.
+    agent = SEOAgent(df) if df is not None else seo_agent
+    return await agent.execute_query(query)

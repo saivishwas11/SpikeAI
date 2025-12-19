@@ -3,7 +3,7 @@ from openai import OpenAI, APIError
 
 # LiteLLM proxy details
 BASE_URL = "http://3.110.18.218"
-MODEL = "gemini-1.5-flash"
+MODEL = "gemini-2.5-flash"
 
 # ⚠️ Store key in environment variable in real setups
 client = OpenAI(
